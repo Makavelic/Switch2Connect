@@ -4345,10 +4345,21 @@ class VirtualController:
                     self.usbip_server_pro = None
 
             if getattr(self, 'running', True):
-                try:
-                    await self.init_added_controller(self.controllers[0])
-                except Exception as e:
-                    logger.error(f"Failed to re-init remaining controller after split/remove: {e}")
+                remaining = self.controllers[0]
+                remaining_client = getattr(remaining, "client", None)
+                if remaining_client is not None and getattr(remaining_client, "is_connected", False):
+                    try:
+                        await self.init_added_controller(remaining)
+                    except Exception as e:
+                        logger.error(f"Failed to re-init remaining controller after split/remove: {e}")
+                else:
+                    # Both halves of a merged System-Bluetooth pair can disconnect
+                    # almost simultaneously. The first callback must not issue setup
+                    # commands to the peer whose WinRT link is already gone; its own
+                    # callback will remove it next.
+                    logger.info(
+                        "Player %s: skipping remaining-controller re-init because its transport is disconnected.",
+                        self.player_number)
             return False
 
     def _dualsense_rumble_callback(self, out_data, side="Pro"):

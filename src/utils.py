@@ -144,6 +144,36 @@ def get_local_mac_value():
         return _CACHED_LOCAL_MAC_VALUE
     raise RuntimeError("No local Bluetooth adapter found or Bluetooth is disabled.")
 
+
+async def get_system_bluetooth_host_identity():
+    """Return the MAC of the adapter used by the Windows WinRT BLE route.
+
+    PyBluez returns the first enumerated radio, which is not necessarily the
+    Windows default radio used by Bleak/WinRT when more than one adapter exists.
+    Keep PyBluez only as a compatibility fallback for older WinRT packages.
+    """
+    winrt_error = None
+    for module_name in (
+            "winrt.windows.devices.bluetooth",
+            "bleak_winrt.windows.devices.bluetooth"):
+        try:
+            module = __import__(module_name, fromlist=["BluetoothAdapter"])
+            adapter = await module.BluetoothAdapter.get_default_async()
+            value = int(getattr(adapter, "bluetooth_address", 0) or 0)
+            if value:
+                return value, "winrt_default"
+        except Exception as error:
+            winrt_error = error
+    # Preserve the established path when the WinRT adapter API is unavailable.
+    try:
+        return get_local_mac_value(), "pybluez_fallback"
+    except Exception:
+        if winrt_error is not None:
+            raise RuntimeError(
+                f"Could not resolve the Windows default Bluetooth adapter: {winrt_error}"
+            ) from winrt_error
+        raise
+
 def get_stick_xy(data: bytes):
     """Convert 3 bytes containing stick x y values into these values"""
     value = decodeu(data)
@@ -240,7 +270,22 @@ def is_packaged():
     global _IS_PACKAGED_CACHE
     if _IS_PACKAGED_CACHE is not None:
         return _IS_PACKAGED_CACHE
-    packaged = False
+    # Keep a build-time marker as a second, deterministic signal.  Some Store
+    # launches have package identity, but GetCurrentPackageFullName can still be
+    # unavailable/denied early in process startup.  A marker is embedded only by
+    # the MSIX build, never by the standalone package scripts.
+    marker_candidates = []
+    try:
+        frozen_root = getattr(sys, "_MEIPASS", "")
+        executable_root = os.path.dirname(sys.executable)
+        marker_candidates = [
+            os.path.join(frozen_root, "resources", "msix_build.marker"),
+            os.path.join(executable_root, "resources", "msix_build.marker"),
+            os.path.join(executable_root, "_internal", "resources", "msix_build.marker"),
+        ]
+    except Exception:
+        marker_candidates = []
+    packaged = any(path and os.path.isfile(path) for path in marker_candidates)
     try:
         import ctypes
         from ctypes import wintypes
@@ -249,9 +294,9 @@ def is_packaged():
         # APPMODEL_ERROR_NO_PACKAGE (15700), and every other error, do not prove
         # that this process has package identity.
         rc = ctypes.windll.kernel32.GetCurrentPackageFullName(ctypes.byref(length), None)
-        packaged = _package_identity_result_has_identity(rc)
+        packaged = packaged or _package_identity_result_has_identity(rc)
     except Exception:
-        packaged = False
+        pass
     _IS_PACKAGED_CACHE = packaged
     return packaged
 

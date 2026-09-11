@@ -62,6 +62,9 @@ BRIDGE_SCAN_ACTIVE = False
 
 CDC_WAKE_DELAY_SECONDS = 0.1
 CDC_WRITE_TIMEOUT_SECONDS = 0.003
+STATUS_WRITE_TIMEOUT_SECONDS = 0.25
+SERIAL_OPERATION_LOCK = threading.RLock()
+FLASH_OPERATION_ACTIVE = threading.Event()
 
 def _set_current_thread_priority(level):
     try:
@@ -1262,7 +1265,7 @@ def scan_serial_ports():
         else:
             ports_by_name[port] = PortInfo(
                 port, name, manufacturer, device_id, likely, otg,
-                confidence, serial_number)
+                confidence, serial_number, location)
 
     # pyserial provides the COM path and hardware ID for normal CDC/CH343 boards.
     # Prefer it at startup: WMI's full PnP traversal is comparatively expensive.
@@ -1339,7 +1342,7 @@ def _active_client_for_port(port: str):
             return client
     return None
 
-def send_serial_command(port: str, command="status lite", timeout=1.2):
+def _send_serial_command_impl(port: str, command="status lite", timeout=1.2):
     active_client = _active_client_for_port(port)
     if active_client is not None:
         return active_client.send_manager_command(command, timeout=timeout)
@@ -1348,7 +1351,7 @@ def send_serial_command(port: str, command="status lite", timeout=1.2):
     try:
         handle = serial.Serial(
             port, baudrate=2000000, timeout=0.1,
-            write_timeout=CDC_WRITE_TIMEOUT_SECONDS)
+            write_timeout=STATUS_WRITE_TIMEOUT_SECONDS)
         payload = (command.strip() + "\n").encode("utf-8")
         deadline = time.monotonic() + max(0.05, float(timeout))
 
@@ -1418,6 +1421,17 @@ def send_serial_command(port: str, command="status lite", timeout=1.2):
                 handle.close()
             except Exception:
                 pass
+
+def send_serial_command(port: str, command="status lite", timeout=1.2):
+    # Do not let periodic status polling steal or reset a COM handle while
+    # esptool owns it.  This is especially visible in packaged builds where
+    # process startup takes longer.
+    if FLASH_OPERATION_ACTIVE.is_set():
+        return ""
+    with SERIAL_OPERATION_LOCK:
+        if FLASH_OPERATION_ACTIVE.is_set():
+            return ""
+        return _send_serial_command_impl(port, command, timeout)
 
 def get_serial_status(port_info: PortInfo | None):
     if not port_info:
@@ -1792,20 +1806,38 @@ def _esp32s3_root():
 
     import shutil
     src = get_driver_path("esp32s3")
+    version_seed = os.path.join(src, "firmware", "v5.9", "firmware_manifest.json")
+    digest = hashlib.sha256()
+    for fingerprint_path in (version_seed, os.path.join(src, "tools", "esptool.exe")):
+        with open(fingerprint_path, "rb") as fingerprint_file:
+            for chunk in iter(lambda: fingerprint_file.read(1024 * 1024), b""):
+                digest.update(chunk)
     base = os.path.join(
         os.environ.get("LOCALAPPDATA", os.environ.get("TEMP", os.path.expanduser("~"))),
         "Switch 2 Connect", "esp32s3_runtime",
     )
+    target = os.path.join(base, f"fw-{APP_FIRMWARE_VERSION}-{digest.hexdigest()[:12]}")
+    staged_tool = os.path.join(target, "tools", "esptool.exe")
+    staged_manifest = os.path.join(target, "firmware", "v5.9", "firmware_manifest.json")
     try:
-        if os.path.exists(base):
-            shutil.rmtree(base, ignore_errors=True)
-        shutil.copytree(src, base)
-        _STAGED_ESP32S3_ROOT = base
-        logger.info("Staged ESP32-S3 tools/firmware to writable dir for packaged build: %s", base)
-        return base
+        if not (os.path.isfile(staged_tool) and os.path.isfile(staged_manifest)):
+            os.makedirs(base, exist_ok=True)
+            temporary = target + f".tmp-{os.getpid()}-{threading.get_ident()}"
+            shutil.rmtree(temporary, ignore_errors=True)
+            shutil.copytree(src, temporary)
+            if not (os.path.isfile(os.path.join(temporary, "tools", "esptool.exe"))
+                    and os.path.isfile(os.path.join(temporary, "firmware", "v5.9", "firmware_manifest.json"))):
+                raise RuntimeError("staged ESP32-S3 assets failed validation")
+            try:
+                os.replace(temporary, target)
+            except FileExistsError:
+                shutil.rmtree(temporary, ignore_errors=True)
+        _STAGED_ESP32S3_ROOT = target
+        logger.info("ESP32-S3 packaged runtime: source=%s staged=%s", src, target)
+        return target
     except Exception as e:
         # Fall back to the bundled location; flashing may still work in some setups.
-        logger.error("Failed to stage ESP32-S3 assets to %s: %s", base, e)
+        logger.error("Failed to stage ESP32-S3 assets to %s: %s", target, e)
         return src
 
 def get_firmware_root():
@@ -1874,6 +1906,15 @@ def _run_esptool(args, progress=None, timeout=None):
             flash_log("  " + line)
             if progress:
                 progress(line)
+                lower_line = line.lower()
+                if "connecting" in lower_line:
+                    progress({"percent": 15, "message": line})
+                elif "chip is esp32-s3" in lower_line:
+                    progress({"percent": 22, "message": line})
+                elif "erasing flash" in lower_line:
+                    progress({"percent": 35, "message": line})
+                elif "chip erase completed successfully" in lower_line:
+                    progress({"percent": 95, "message": line})
                 match = re.search(r"\((\d{1,3})\s*%\)", line)
                 if match:
                     percent = max(0, min(100, int(match.group(1))))
@@ -2004,7 +2045,92 @@ def release_port(port: str):
                 logger.debug(f"Failed to close client on {port}: {e}")
 
 
-def flash_firmware(port: str, mode="install", profile_id=EXPECTED_FIRMWARE_PROFILE, progress=None):
+def resolve_flash_port(preferred_port=None, manual=False):
+    """Resolve a flashing port from a fresh enumeration, without guessing among peers."""
+    all_serials = [item for item in scan_serial_ports() if not item.is_otg]
+    # Auto mode accepts only recognized ESP/CH343 identities or generic USB
+    # serial descriptions.  Low-confidence legacy COM devices stay available
+    # for an explicit manual choice, but are never selected automatically.
+    candidates = [item for item in all_serials if item.confidence >= 20]
+    preferred = (preferred_port or "").upper()
+    logger.info(
+        "ESP32-S3 flash-port resolution: mode=%s preferred=%s candidates=%s",
+        "manual" if manual else "auto", preferred or "<none>",
+        [(item.port, item.confidence, item.serial_number, item.location) for item in candidates],
+    )
+    if manual:
+        match = next((item for item in all_serials if item.port.upper() == preferred), None)
+        if match:
+            return match
+        saved_serial = str(getattr(CONFIG, "esp32_serial_number", "") or "").upper()
+        saved_location = str(getattr(CONFIG, "esp32_serial_location", "") or "").upper()
+        same_device = [item for item in all_serials if (
+            (saved_serial and item.serial_number.upper() == saved_serial)
+            or (saved_location and item.location.upper() == saved_location)
+        )]
+        if len(same_device) == 1:
+            logger.info("ESP32-S3 selected device moved from %s to %s", preferred, same_device[0].port)
+            return same_device[0]
+        raise RuntimeError(
+            f"The selected flashing port {preferred or '<none>'} is no longer available. "
+            "Select its current COM port from Flashing Port."
+        )
+
+    saved_serial = str(getattr(CONFIG, "esp32_serial_number", "") or "").upper()
+    saved_location = str(getattr(CONFIG, "esp32_serial_location", "") or "").upper()
+    identity_matches = [item for item in candidates if (
+        (saved_serial and item.serial_number.upper() == saved_serial)
+        or (saved_location and item.location.upper() == saved_location)
+    )]
+    if len(identity_matches) == 1:
+        return identity_matches[0]
+
+    high_confidence = [item for item in candidates if item.confidence >= 80]
+    if len(high_confidence) == 1:
+        return high_confidence[0]
+    if len(high_confidence) > 1 and high_confidence[0].confidence > high_confidence[1].confidence:
+        return high_confidence[0]
+    if len(candidates) == 1:
+        return candidates[0]
+    if not candidates:
+        raise RuntimeError("Could not find a CH343/USB serial flashing port.")
+    raise RuntimeError(
+        "More than one possible flashing port was found. Select the ESP32-S3 port "
+        "manually from Flashing Port before continuing."
+    )
+
+
+def stabilize_flash_port(selected, timeout=2.5):
+    """Follow the same USB device when Windows changes its COM number in Boot mode."""
+    deadline = time.monotonic() + timeout
+    stable_port = None
+    stable_count = 0
+    while time.monotonic() < deadline:
+        candidates = [item for item in scan_serial_ports() if not item.is_otg and item.confidence > 0]
+        match = None
+        for field in ("serial_number", "location", "device_id"):
+            value = str(getattr(selected, field, "") or "").upper()
+            matches = [item for item in candidates if value and str(getattr(item, field, "") or "").upper() == value]
+            if len(matches) == 1:
+                match = matches[0]
+                break
+        if match is None:
+            match = next((item for item in candidates if item.port.upper() == selected.port.upper()), None)
+        if match:
+            if stable_port == match.port:
+                stable_count += 1
+            else:
+                stable_port, stable_count = match.port, 1
+            selected = match
+            if stable_count >= 2:
+                logger.info("ESP32-S3 flash port stabilized on %s", match.port)
+                return match
+        time.sleep(0.15)
+    logger.info("ESP32-S3 flash port stabilization timed out; using %s", selected.port)
+    return selected
+
+
+def _flash_firmware_impl(port: str, mode="install", profile_id=EXPECTED_FIRMWARE_PROFILE, progress=None):
     # Snapshot identity before esptool resets/re-enumerates the USB device.  It is
     # deliberately not trusted or persisted unless ROM validation and writing
     # complete successfully below.
@@ -2024,7 +2150,6 @@ def flash_firmware(port: str, mode="install", profile_id=EXPECTED_FIRMWARE_PROFI
         if progress:
             progress({"percent": 8, "message": f"Connecting to ESP32-S3 on {port}"})
         if progress:
-            progress({"percent": 30, "message": "Erasing flash"})
             progress(f"{ESP32S3_LABEL}: erasing flash")
         try:
             _run_esptool_attempts([
@@ -2072,3 +2197,12 @@ def flash_firmware(port: str, mode="install", profile_id=EXPECTED_FIRMWARE_PROFI
         # is installation success. CDC identity is checked after the user re-plugs,
         # when Windows has finished re-enumerating the device.
         progress({"percent": 100, "message": "Firmware flashing completed"})
+
+
+def flash_firmware(port: str, mode="install", profile_id=EXPECTED_FIRMWARE_PROFILE, progress=None):
+    with SERIAL_OPERATION_LOCK:
+        FLASH_OPERATION_ACTIVE.set()
+        try:
+            return _flash_firmware_impl(port, mode=mode, profile_id=profile_id, progress=progress)
+        finally:
+            FLASH_OPERATION_ACTIVE.clear()

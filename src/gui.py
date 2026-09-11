@@ -97,7 +97,7 @@ print("This program comes with ABSOLUTELY NO WARRANTY; for details type `show w'
 print("This is free software, and you are welcome to redistribute it")
 print("under certain conditions; type `show c' for details.")
 
-APP_VERSION = "v2.8"
+APP_VERSION = "v2.9"
 MAG_TESTER_BUILD_ENABLED = mag_tester_build_enabled()
 
 def _set_current_thread_priority(level):
@@ -3798,7 +3798,10 @@ class ControllerWindow:
 
     def _run_flash_in_dialog(self, action, status, dialog, info_label, progress_var, percent_label, on_done):
         try:
-            from usb_serial_bridge import ESP32S3_LABEL, flash_firmware
+            from usb_serial_bridge import (
+                ESP32S3_LABEL, flash_firmware, resolve_flash_port,
+                stabilize_flash_port,
+            )
         except Exception:
             ESP32S3_LABEL = "ESP32-S3 CDC"
             flash_firmware = None
@@ -3818,17 +3821,24 @@ class ControllerWindow:
         except Exception:
             pass
 
-        if not status or not status.serial_port:
+        try:
+            manual_port = getattr(CONFIG, "esp32_serial_port_mode", "auto") == "manual"
+            requested_port = ""
+            if manual_port:
+                requested_port = str(getattr(CONFIG, "esp32_serial_port", "") or "")
+            selected_port = resolve_flash_port(requested_port, manual=manual_port)
+            selected_port = stabilize_flash_port(selected_port)
+        except Exception as e:
             self._esp32s3_firmware_busy = False
             if discoverer_was_running:
                 self.start_discoverer_thread()
-            on_done(False, "Could not find the ESP32-S3 N16R8 CH343/COM flashing port.\nConnect the flashing port and try again.")
+            on_done(False, str(e))
             return
 
         verb_map = {"install": "Installing", "repair": "Repairing", "delete": "Deleting"}
         if dialog.winfo_exists():
             info_label.config(
-                text=f"{ESP32S3_LABEL}: {verb_map.get(action, 'Working')} firmware on {status.serial_port.port}..."
+                text=f"{ESP32S3_LABEL}: {verb_map.get(action, 'Working')} firmware on {selected_port.port}..."
             )
 
         done = {"ok": False, "error": None}
@@ -3839,7 +3849,7 @@ class ControllerWindow:
 
         def worker():
             try:
-                flash_firmware(status.serial_port.port, mode=action, progress=progress)
+                flash_firmware(selected_port.port, mode=action, progress=progress)
                 done["ok"] = True
             except Exception as e:
                 done["error"] = e
@@ -4221,18 +4231,30 @@ class ControllerWindow:
         return f'-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "{script_path}"'
 
     @staticmethod
-    def _read_winuhid_uninstall_log():
-        log_path = os.path.join(os.environ.get("TEMP", ""), "Switch2Connect_WinUHid_uninstall.log")
+    def _read_winuhid_operation_log(operation="uninstall"):
+        filename = ("Switch2Connect_WinUHid_install.log" if operation == "install"
+                    else "Switch2Connect_WinUHid_uninstall.log")
+        log_path = os.path.join(os.environ.get("TEMP", ""), filename)
         try:
             with open(log_path, "r", encoding="utf-8", errors="replace") as stream:
                 content = stream.read().strip()
             lines = content.splitlines()
-            keywords = ("error", "failed", "incomplete", "does not exist", "fallback")
+            keywords = ("error", "failed", "incomplete", "not recognized",
+                        "could not be resolved", "fallback")
             important = [line for line in lines if any(word in line.lower() for word in keywords)]
-            summary = important[-12:] if important else lines[-12:]
-            return "\n".join(summary)[-1400:]
+            # Preserve order while suppressing repeated PowerShell command-not-found
+            # blocks that otherwise fill the application error dialog.
+            summary = []
+            for line in important or lines:
+                if line not in summary:
+                    summary.append(line)
+            return "\n".join(summary[-6:])[-900:] + f"\nLog: {log_path}"
         except Exception:
-            return "Uninstaller log was not available."
+            return f"Operation log was not available.\nLog: {log_path}"
+
+    @staticmethod
+    def _read_winuhid_uninstall_log():
+        return ControllerWindow._read_winuhid_operation_log("uninstall")
 
     @staticmethod
     def _read_vigembus_uninstall_log():
@@ -4584,11 +4606,12 @@ class ControllerWindow:
                     if show_success_msg:
                         self.show_centered_message("Success", "WinUHid driver installed successfully.")
                 else:
+                    install_log = self._read_winuhid_operation_log("install")
                     self.show_centered_message(
                         "Error",
                         "Driver installation was not completed or failed.\n\n"
                         f"Exit code: {proc_exit_code[0]}\nRuntime smoke test: {runtime_ok}\n"
-                        f"{driver_status.describe()}"
+                        f"{driver_status.describe()}\n\nInstaller details:\n{install_log}"
                     )
                     if getattr(CONFIG, "keyboard_output_mode", None) == keyboard_output.RAW_INPUT:
                         keyboard_output.activate_raw_input(save=False)
@@ -5086,7 +5109,11 @@ class ControllerWindow:
             if hasattr(self, 'driver_frame'):
                 self.driver_frame.pack(side=tk.LEFT, padx=int(5 * scaling_factor))
 
-        if getattr(self, 'esp32s3_detected', False) and hasattr(self, 'esp32s3_frame'):
+        # Firmware management must remain reachable for a factory-state board.
+        # Detection controls the label/color only; hiding this entry creates a
+        # deadlock because unverified candidates are intentionally discovered
+        # only inside the firmware dialog.
+        if hasattr(self, 'esp32s3_frame'):
             esp_status = getattr(self, 'esp32s3_bridge_status', None)
             update_needed = bool(esp_status and getattr(esp_status, 'firmware_update_required', False))
             not_installed = bool(esp_status and not getattr(esp_status, 'firmware_installed', True))

@@ -1314,7 +1314,7 @@ async def run_discovery(quit_event, startup_bridge_context=None):
         host_mac_value = None
         logger.info("Controller connection route: system bluetooth")
         
-        from utils import get_local_mac_value, bluetooth_radio_present
+        from utils import get_system_bluetooth_host_identity, bluetooth_radio_present
 
         # Runs for every wireless state below, including while waiting for a radio, so
         # auto-disconnect keeps working for wired controllers on a machine with no radio.
@@ -1345,14 +1345,27 @@ async def run_discovery(quit_event, startup_bridge_context=None):
                     logger.info("Quit event set during Bluetooth initialization.")
                     return
                 try:
-                    # PyBluez's read_local_bdaddr() is a blocking call; keep it off the
-                    # shared event loop so it cannot stall the wired route.
-                    host_mac_value = await asyncio.to_thread(get_local_mac_value)
+                    # Bleak scans through the Windows default WinRT adapter. Use that
+                    # same adapter for reconnect filtering and Nintendo SET_MAC.
+                    host_mac_value, host_mac_source = await get_system_bluetooth_host_identity()
                     # Test scanner initialization to verify WinRT stack is ready. Left on
                     # the loop thread deliberately: WinRT objects are apartment-bound.
                     scanner = BleakScanner()
                     bluetooth_initialized = True
-                    logger.info(f"Bluetooth adapter and stack initialized successfully. Host MAC: {host_mac_value}")
+                    logger.info(
+                        "Bluetooth adapter and stack initialized successfully. Host MAC: %s (source=%s)",
+                        host_mac_value, host_mac_source)
+                    if _SYSTEM_BT_DIAGNOSTICS:
+                        try:
+                            pybluez_addresses = await asyncio.to_thread(bluetooth.read_local_bdaddr)
+                            pybluez_values = [convert_mac_string_to_value(value)
+                                              for value in pybluez_addresses]
+                        except Exception:
+                            pybluez_values = []
+                        _sysbt_diag(
+                            "adapter_source=%s pybluez_count=%d pybluez_default_match=%s",
+                            host_mac_source, len(pybluez_values),
+                            str(host_mac_value in pybluez_values).lower())
                     break
                 except Exception as e:
                     # Flip the flag on the first failure, not after all the retries, so the
@@ -1380,6 +1393,8 @@ async def run_discovery(quit_event, startup_bridge_context=None):
         sysbt_diag_states = {}
         sysbt_diag_seen = {}
         sysbt_diag_last_snapshot = 0.0
+        sysbt_attempt_generations = {}
+        sysbt_side_decisions = {}
 
         def sysbt_side(product_id):
             name = str(CONTROLER_NAMES.get(product_id, "Controller"))
@@ -1394,8 +1409,17 @@ async def run_discovery(quit_event, startup_bridge_context=None):
             if not _SYSTEM_BT_DIAGNOSTICS:
                 return
             now = time.monotonic()
+            if stage == "task_created":
+                generation = sysbt_attempt_generations.get(address, 0) + 1
+                sysbt_attempt_generations[address] = generation
+                sysbt_diag_states[address] = {
+                    "start": now, "stage_started": now, "stage": "created",
+                    "attempt": generation,
+                    "side": sysbt_side(advertised_pid) if advertised_pid is not None else "unknown",
+                }
             state = sysbt_diag_states.setdefault(address, {
                 "start": now, "stage_started": now, "stage": "created",
+                "attempt": sysbt_attempt_generations.get(address, 0),
                 "side": sysbt_side(advertised_pid) if advertised_pid is not None else "unknown",
             })
             previous = state.get("stage")
@@ -1406,8 +1430,8 @@ async def run_discovery(quit_event, startup_bridge_context=None):
                 state["side"] = sysbt_side(advertised_pid)
             details = " ".join(f"{key}={value}" for key, value in extra.items())
             _sysbt_diag(
-                "device=%s side=%s stage=%s previous=%s stage_ms=%d total_ms=%d%s%s",
-                _sysbt_device_id(address), state["side"], stage, previous,
+                "device=%s side=%s attempt=%d stage=%s previous=%s stage_ms=%d total_ms=%d%s%s",
+                _sysbt_device_id(address), state["side"], state.get("attempt", 0), stage, previous,
                 int(stage_elapsed * 1000), int(elapsed * 1000),
                 " " if details else "", details)
 
@@ -1467,13 +1491,21 @@ async def run_discovery(quit_event, startup_bridge_context=None):
             peers_at_start = set(connected_mac_addresses)
             stage = "task_created"
             sysbt_stage(device.address, stage, advertised_product_id, paired=paired)
+            attempt_generation = sysbt_attempt_generations.get(device.address, 0)
             try:
                 controller = Controller(device, advertised_product_id=advertised_product_id,
                                         paired_connection=paired)
                 if _SYSTEM_BT_DIAGNOSTICS:
-                    controller._system_bt_diag_callback = (
-                        lambda detail_stage, **detail: sysbt_stage(
-                            device.address, detail_stage, advertised_product_id, **detail))
+                    def controller_diag(detail_stage, **detail):
+                        if sysbt_attempt_generations.get(device.address, 0) != attempt_generation:
+                            _sysbt_diag(
+                                "device=%s side=%s decision=ignored_stale_attempt_callback attempt=%d",
+                                _sysbt_device_id(device.address), sysbt_side(advertised_product_id),
+                                attempt_generation,
+                                rate_key=(device.address, "stale_attempt"), rate_seconds=5.0)
+                            return
+                        sysbt_stage(device.address, detail_stage, advertised_product_id, **detail)
+                    controller._system_bt_diag_callback = controller_diag
                 # Serialize only native link establishment. Initialization uses
                 # this controller's independent GATT characteristics and may run
                 # while the peer starts connecting.
@@ -1501,7 +1533,10 @@ async def run_discovery(quit_event, startup_bridge_context=None):
                     stage = "pair_started"
                     sysbt_stage(device.address, stage, advertised_product_id)
                     async with CONNECTION_LOCK:
-                        await controller.pair()
+                        # Use the same WinRT-default radio identity that accepted this
+                        # advertisement. Controller.pair() must not independently pick
+                        # PyBluez's first radio on a multi-adapter machine.
+                        await controller.pair(host_mac_value=host_mac_value)
                     sysbt_stage(device.address, "pair_completed", advertised_product_id)
                     logger.info(f"Paired successfully to {device.address}")
                 # BLE connection confirmed -- promote to connected so scanner won't retry
@@ -1565,6 +1600,7 @@ async def run_discovery(quit_event, startup_bridge_context=None):
                 sysbt_stage(device.address, stage, advertised_product_id)
                 await asyncio.to_thread(virtual_controller.setup_virtual_device)
                 sysbt_stage(device.address, "virtual_device_ready", advertised_product_id)
+                sysbt_side_decisions[sysbt_side(advertised_product_id)] = "ready"
                 async def _refresh_leds_after_virtual_ready():
                     try:
                         await update_all_player_leds()
@@ -1573,6 +1609,7 @@ async def run_discovery(quit_event, startup_bridge_context=None):
                 asyncio.create_task(_refresh_leds_after_virtual_ready())
                 asyncio.create_task(trigger_connection_haptics(controller))
             except Exception as error:
+                sysbt_side_decisions[sysbt_side(advertised_product_id)] = "failed"
                 peer_dropped = bool(peers_at_start - set(connected_mac_addresses))
                 classification = _sysbt_error_class(stage, error, peer_dropped=peer_dropped)
                 hresult = getattr(error, "hresult", getattr(error, "winerror", ""))
@@ -1637,6 +1674,7 @@ async def run_discovery(quit_event, startup_bridge_context=None):
                         return
                     logger.debug(f"Manufacturer data: {to_hex(nintendo_manufacturer_data)}")
                     if reconnect_mac == 0:
+                        sysbt_side_decisions[side] = "pairing"
                         _sysbt_diag("device=%s side=%s decision=connect_pairing reconnect=zero",
                                     _sysbt_device_id(device.address), side)
                         logger.info(f"Found pairing device {CONTROLER_NAMES[product_id]} {device.address}")
@@ -1645,6 +1683,7 @@ async def run_discovery(quit_event, startup_bridge_context=None):
                             pending_connections_count += 1
                         asyncio.create_task(add_controller(device, False, product_id))
                     elif reconnect_mac == host_mac_value:
+                        sysbt_side_decisions[side] = "reconnecting"
                         _sysbt_diag("device=%s side=%s decision=connect_paired reconnect=local",
                                     _sysbt_device_id(device.address), side)
                         logger.info(f"Found already paired device {CONTROLER_NAMES[product_id]} {device.address}")
@@ -1653,6 +1692,7 @@ async def run_discovery(quit_event, startup_bridge_context=None):
                             pending_connections_count += 1
                         asyncio.create_task(add_controller(device, True, product_id))
                     else:
+                        sysbt_side_decisions[side] = "blocked_other_host"
                         _sysbt_diag(
                             "device=%s side=%s decision=ignored_paired_to_different_host "
                             "classification=PAIRED_TO_DIFFERENT_HOST reconnect=other local_match=false",
@@ -1697,10 +1737,12 @@ async def run_discovery(quit_event, startup_bridge_context=None):
                                 watcher_status = getattr(scanner._backend.watcher, 'status', "unknown")
                             _sysbt_diag(
                                 "snapshot scanner=%s connected=%s connecting=%s pending=%d "
-                                "stages=%s last_advertisement_age_s=%s",
+                                "stages=%s last_advertisement_age_s=%s pair_status=L:%s,R:%s",
                                 watcher_status, _sysbt_device_ids(connected_mac_addresses),
                                 _sysbt_device_ids(sorted(_connecting_macs)), pending_connections_count,
-                                active, seen_age)
+                                active, seen_age,
+                                sysbt_side_decisions.get("L", "not_seen"),
+                                sysbt_side_decisions.get("R", "not_seen"))
                         if full_capacity_reached():
                             logger.info("Full power-saving capacity reached; pausing automatic BLE scan")
                             break
@@ -2241,8 +2283,19 @@ def emergency_cleanup():
 async def update_all_player_leds():
     for vc in VIRTUAL_CONTROLLERS:
         if vc is not None:
-            for c in vc.controllers:
-                await c.set_leds(vc.player_number)
+            for c in list(vc.controllers):
+                client = getattr(c, "client", None)
+                if client is None or not getattr(client, "is_connected", False):
+                    continue
+                try:
+                    await c.set_leds(vc.player_number)
+                except Exception as error:
+                    # LED assignment is non-critical. A peer may disconnect between
+                    # the is_connected check and the write; never let that race abort
+                    # the disconnect callback or leave a stale virtual-controller slot.
+                    logger.info(
+                        "Skipping player LED update for disconnected controller %s: %s",
+                        getattr(getattr(c, "device", None), "address", "unknown"), error)
 
 async def _split_controller_async(vc_index):
     global GLOBAL_LOCK

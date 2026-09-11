@@ -1,9 +1,36 @@
 $ErrorActionPreference = "Stop"
+$LogPath = Join-Path $env:TEMP "Switch2Connect_WinUHid_install.log"
+Set-Content -LiteralPath $LogPath -Value "WinUHid install started $(Get-Date -Format o)" -Encoding UTF8
+
+function Write-InstallLog {
+    param([string]$Message)
+    Write-Host $Message
+    Add-Content -LiteralPath $LogPath -Value $Message -Encoding UTF8
+}
 
 # Get Administrator permissions
 if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
     Write-Host "Please run this script as Administrator!" -ForegroundColor Red
     Exit 1
+}
+
+function Resolve-SystemTool {
+    param([Parameter(Mandatory = $true)][string]$Name)
+    $candidates = @()
+    if ($env:PROCESSOR_ARCHITEW6432 -and $env:WINDIR) {
+        $candidates += (Join-Path $env:WINDIR "Sysnative\$Name")
+    }
+    $systemDirectory = [Environment]::SystemDirectory
+    if ($systemDirectory) { $candidates += (Join-Path $systemDirectory $Name) }
+    foreach ($candidate in $candidates) {
+        if (Test-Path -LiteralPath $candidate -PathType Leaf) {
+            return [System.IO.Path]::GetFullPath($candidate)
+        }
+    }
+    $command = Get-Command $Name -CommandType Application -ErrorAction SilentlyContinue |
+        Select-Object -First 1
+    if ($command) { return $command.Source }
+    return $null
 }
 
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -58,6 +85,19 @@ if (-not $CertPath -or -not (Test-Path $CertPath)) {
     Write-Host "Error: Driver Certificate not found!" -ForegroundColor Red
     Exit 1
 }
+
+# Resolve every required Windows utility before cleaning up an existing driver.
+# This keeps a failed preflight from turning a healthy/partial installation into
+# a more incomplete state.
+$script:PnpUtilPath = Resolve-SystemTool "pnputil.exe"
+$script:CertUtilPath = Resolve-SystemTool "certutil.exe"
+$script:ScPath = Resolve-SystemTool "sc.exe"
+Write-InstallLog "System tools: pnputil=$($script:PnpUtilPath); certutil=$($script:CertUtilPath); sc=$($script:ScPath); systemDirectory=$([Environment]::SystemDirectory)"
+if (-not $script:PnpUtilPath -or -not $script:CertUtilPath -or -not $script:ScPath) {
+    Write-InstallLog "ERROR: A required Windows system tool could not be resolved; no driver changes were made."
+    Exit 1
+}
+Write-InstallLog "Preflight complete: INF and certificate are present."
 
 # cfgmgr32 is the API pnputil itself calls. It has been stable since Windows 2000
 # and needs no elevation, unlike pnputil's /enum-devices options, whose command
@@ -131,7 +171,7 @@ function Invoke-PnpUtilEnum {
     }
     $attempts += ,$BaseArguments
     foreach ($attempt in $attempts) {
-        $output = & pnputil @attempt 2>&1
+        $output = & $script:PnpUtilPath @attempt 2>&1
         $code = $LASTEXITCODE
         if ($code -eq 0 -or $code -eq 259) {
             if ($attempt.Count -gt $BaseArguments.Count) { $script:PnpUtilRichEnum = $true }
@@ -158,7 +198,7 @@ if ($null -eq $deviceInstances) {
     } | Select-Object -Unique)
 }
 foreach ($instance in $deviceInstances) {
-    pnputil /remove-device $instance /force
+    & $script:PnpUtilPath /remove-device $instance /force
     if ($LASTEXITCODE -ne 0) {
         Write-Host "Exact removal failed for $instance; trying device-ID fallback." -ForegroundColor Yellow
     }
@@ -166,7 +206,7 @@ foreach ($instance in $deviceInstances) {
 if ($deviceInstances.Count -gt 0) {
     $remainingOutput = Invoke-PnpUtilEnum -BaseArguments @("/enum-devices", "/deviceid", "Root\WinUHid")
     if (($remainingOutput -join "`n") -match '(?i)ROOT\\WINUHID\\') {
-        pnputil /remove-device /deviceid "Root\WinUHid" /force
+        & $script:PnpUtilPath /remove-device /deviceid "Root\WinUHid" /force
         if ($LASTEXITCODE -ne 0) {
             Write-Host "Historical WinUHid records could not be removed; installation will use a new Root instance ID." -ForegroundColor Yellow
         }
@@ -175,7 +215,7 @@ if ($deviceInstances.Count -gt 0) {
 
 # 2. Clean up existing driver packages from Driver Store
 Write-Host "Scanning Driver Store for old WinUHid packages..." -ForegroundColor Yellow
-$drivers = pnputil /enum-drivers
+$drivers = & $script:PnpUtilPath /enum-drivers
 $oldInfs = @()
 $currentInf = ""
 foreach ($line in $drivers) {
@@ -194,7 +234,7 @@ foreach ($line in $drivers) {
 
 foreach ($inf in $oldInfs) {
     Write-Host "Deleting old driver package $inf from Driver Store..." -ForegroundColor Yellow
-    pnputil /delete-driver $inf /uninstall /force
+    & $script:PnpUtilPath /delete-driver $inf /uninstall /force
     if ($LASTEXITCODE -ne 0) {
         Write-Host "Failed to remove old Driver Store package $inf" -ForegroundColor Red
         Exit 1
@@ -204,9 +244,9 @@ foreach ($inf in $oldInfs) {
 
 # 4. Install certificate to TrustedPublisher and Root store
 Write-Host "Installing certificate to TrustedPublisher and Root stores..." -ForegroundColor Cyan
-certutil -addstore -f "TrustedPublisher" $CertPath
+& $script:CertUtilPath -addstore -f "TrustedPublisher" $CertPath
 if ($LASTEXITCODE -ne 0) { Write-Host "Failed to install TrustedPublisher certificate" -ForegroundColor Red; Exit 1 }
-certutil -addstore -f "Root" $CertPath
+& $script:CertUtilPath -addstore -f "Root" $CertPath
 if ($LASTEXITCODE -ne 0) { Write-Host "Failed to install Root certificate" -ForegroundColor Red; Exit 1 }
 
 # 5. Install the driver and create the device node using SetupAPI & NewDev.dll
@@ -347,7 +387,7 @@ if (-not $success) {
 
 # 6. Verify service status
 Write-Host "Starting WUDFRd service if needed..." -ForegroundColor Cyan
-sc.exe start WUDFRd
+& $script:ScPath start WUDFRd
 
 # 7. Verify every layer used by the application health check.
 $deviceLayerVerified = $true
@@ -376,7 +416,7 @@ else {
         }
     }
 }
-$verifyDrivers = pnputil /enum-drivers 2>&1
+$verifyDrivers = & $script:PnpUtilPath /enum-drivers 2>&1
 $packagePresent = (($verifyDrivers -join "`n") -match '(?i)winuhiddriver\.inf')
 if (-not $packagePresent) {
     # /enum-drivers needs elevation and can fail; the driver database answers the
@@ -401,6 +441,7 @@ elseif (-not $devicePresent -or -not $packagePresent -or -not $registryPresent) 
 }
 
 Write-Host "Driver installation complete!" -ForegroundColor Green
+Write-InstallLog "Driver installation and verification completed. rebootRequired=$rebootRequired"
 if ($rebootRequired) {
     Write-Host "A system reboot is required for this installation to take effect." -ForegroundColor Yellow
 }

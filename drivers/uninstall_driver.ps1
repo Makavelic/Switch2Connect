@@ -13,13 +13,42 @@ if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdenti
     exit 1
 }
 
+function Resolve-SystemTool {
+    param([Parameter(Mandatory = $true)][string]$Name)
+    $candidates = @()
+    # A 32-bit host on 64-bit Windows must use Sysnative to bypass filesystem
+    # redirection.  The normal 64-bit app continues to use System32.
+    if ($env:PROCESSOR_ARCHITEW6432 -and $env:WINDIR) {
+        $candidates += (Join-Path $env:WINDIR "Sysnative\$Name")
+    }
+    $systemDirectory = [Environment]::SystemDirectory
+    if ($systemDirectory) { $candidates += (Join-Path $systemDirectory $Name) }
+    foreach ($candidate in $candidates) {
+        if (Test-Path -LiteralPath $candidate -PathType Leaf) {
+            return [System.IO.Path]::GetFullPath($candidate)
+        }
+    }
+    $command = Get-Command $Name -CommandType Application -ErrorAction SilentlyContinue |
+        Select-Object -First 1
+    if ($command) { return $command.Source }
+    return $null
+}
+
+$script:PnpUtilPath = Resolve-SystemTool "pnputil.exe"
+$script:CertUtilPath = Resolve-SystemTool "certutil.exe"
+Write-UninstallLog "System tools: pnputil=$($script:PnpUtilPath); certutil=$($script:CertUtilPath); systemDirectory=$([Environment]::SystemDirectory)"
+if (-not $script:PnpUtilPath) {
+    Write-UninstallLog "ERROR: Required Windows system tool pnputil.exe could not be resolved; no changes were made."
+    exit 1
+}
+
 function Invoke-PnpUtil {
     param(
         [Parameter(Mandatory = $true)][string[]]$Arguments,
         [int[]]$AllowedExitCodes = @(0),
         [bool]$LogOutput = $true
     )
-    $output = & pnputil @Arguments 2>&1
+    $output = & $script:PnpUtilPath @Arguments 2>&1
     $code = $LASTEXITCODE
     if ($LogOutput) {
         $output | ForEach-Object { Write-UninstallLog ([string]$_) }
@@ -115,7 +144,7 @@ function Invoke-PnpUtilEnum {
     }
     $attempts += ,$BaseArguments
     foreach ($attempt in $attempts) {
-        $output = & pnputil @attempt 2>&1
+        $output = & $script:PnpUtilPath @attempt 2>&1
         $code = $LASTEXITCODE
         if ($code -eq 0 -or $code -eq 259) {
             if ($attempt.Count -gt $BaseArguments.Count) { $script:PnpUtilRichEnum = $true }
@@ -256,8 +285,13 @@ try {
     }
 
     Write-Host "Removing WinUHidDriver certificates..." -ForegroundColor Yellow
-    & certutil -delstore "TrustedPublisher" "WinUHidDriver" 2>&1 | ForEach-Object { Write-Host $_ }
-    & certutil -delstore "Root" "WinUHidDriver" 2>&1 | ForEach-Object { Write-Host $_ }
+    if ($script:CertUtilPath) {
+        & $script:CertUtilPath -delstore "TrustedPublisher" "WinUHidDriver" 2>&1 | ForEach-Object { Write-Host $_ }
+        & $script:CertUtilPath -delstore "Root" "WinUHidDriver" 2>&1 | ForEach-Object { Write-Host $_ }
+    }
+    else {
+        Write-UninstallLog "WARNING: certutil.exe could not be resolved; certificate cleanup was skipped."
+    }
 
     $registryPath = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\WUDF\Services\WinUHidDriver"
     if (Test-Path $registryPath) {
@@ -274,7 +308,8 @@ try {
             Write-UninstallLog "Second-pass removal failed for $instance. $($_.Exception.Message)"
         }
     }
-    Invoke-PnpUtil -Arguments @("/scan-devices") | Out-Null
+    try { Invoke-PnpUtil -Arguments @("/scan-devices") | Out-Null }
+    catch { Write-UninstallLog "WARNING: Device rescan failed; final verification will decide the result. $($_.Exception.Message)" }
     Start-Sleep -Milliseconds 500
 
     $remainingDevices = Get-PresentWinUHidDeviceInstances

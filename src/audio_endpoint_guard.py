@@ -173,8 +173,13 @@ class DualSenseAudioEndpointGuard:
         # comtypes has no PROPVARIANT (its VARIANT can't carry a VT_LPWSTR, which is
         # how PKEY_Device_FriendlyName comes back).  Declare the minimal PROPVARIANT
         # ourselves — the friendly name lives in the pwszVal arm of the union.
+        class _BLOB(Structure):
+            _fields_ = [("cbSize", DWORD), ("pBlobData", c_void_p)]
+
         class _PROPVARIANT_UNION(Union):
-            _fields_ = [("pwszVal", c_wchar_p), ("ullVal", c_ulonglong)]
+            # The native union also contains a count + pointer (e.g. BLOB).
+            # It occupies 16 bytes on x64, even when reading just a string.
+            _fields_ = [("pwszVal", c_wchar_p), ("ullVal", c_ulonglong), ("blob", _BLOB)]
 
         class PROPVARIANT(Structure):
             _fields_ = [
@@ -242,6 +247,7 @@ class DualSenseAudioEndpointGuard:
             ]
 
         self._comtypes = comtypes
+        self._PROPVARIANT = PROPVARIANT
         self._IMMDeviceEnumerator = IMMDeviceEnumerator
         self._IPolicyConfig = IPolicyConfig
         self._PKEY_Device_FriendlyName = PROPERTYKEY(GUID("{A45C254E-DF1C-4EFD-8020-67D146A850E0}"), 14)

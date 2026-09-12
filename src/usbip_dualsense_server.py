@@ -47,8 +47,6 @@ from dualsense_descriptors import (
     DUALSENSE_CONFIGURATION_DESCRIPTOR, 
     DUALSENSE_CONFIGURATION_DESCRIPTOR_NO_AUDIO,
     DUALSENSE_HID_REPORT_DESCRIPTOR,
-    DUALSENSE_USBIP_SPEED,
-    DUALSENSE_MIC_BYTES_PER_INTERVAL,
     DUALSENSE_STRING_LANG,
     DUALSENSE_STRING_MANUFACTURER,
     DUALSENSE_STRING_PRODUCT,
@@ -66,8 +64,8 @@ DIAGNOSTIC_LOG_INTERVAL = 2.0
 HAPTIC_PROCESS_INTERVAL = 0.015
 ISO_BACKLOG_RELIEF_DEPTH = 4
 ISO_BACKLOG_LOG_INTERVAL = 2.0
-DUALSENSE_USBIP_DESCRIPTOR_PROFILE = "physical-dualsense-high-speed-audio"
-MIC_ISO_BYTES_PER_FRAME = DUALSENSE_MIC_BYTES_PER_INTERVAL
+DUALSENSE_USBIP_DESCRIPTOR_PROFILE = "ds5bridge-full-speed-audio-ep1-adaptive-1ms"
+MIC_ISO_BYTES_PER_FRAME = 96  # 1ch * 16-bit * 48kHz / 1000 USB frames
 ISO_RESET_BARRIER_SEC = 0.025
 AUDIO_OUT_PACER_LEAD_SEC = 0.0010
 AUDIO_OUT_IDLE_RESET_SEC = 0.5
@@ -1483,11 +1481,11 @@ class USBIPDualSenseServer(USBIPServer):
                         reply_iso_descriptors += struct.pack("!IIII", offset, length, length, 0)
                         offset += length
             elif len(iso_descriptors) == num_packets * 16:
-                # ISO IN (mic): usbip-win2 keeps the original packet request
+                # ISO IN (mic): usbip-win2 keeps the original 98-byte request
                 # offsets but consumes a compact payload whose size is the sum of
-                # per-packet actual_length.  A physical DualSense exposes a
-                # 48-kHz, stereo, 16-bit mic stream: 192 actual bytes per 1-ms
-                # interval, with a 196-byte maximum packet slot.
+                # per-packet actual_length.  A 48 kHz mono 16-bit mic produces
+                # 96 bytes per 1 ms frame, so report 96 actual bytes for each
+                # 98-byte slot instead of advertising a faster-than-real clock.
                 for i in range(num_packets):
                     offset, length, _act_len, _pkt_status = struct.unpack("!IIII", iso_descriptors[i*16:(i+1)*16])
                     actual = self._mic_iso_packet_actual_length(length)
@@ -1723,7 +1721,7 @@ class USBIPDualSenseServer(USBIPServer):
             busid_bytes,
             1,      # busnum
             devnum, # devnum
-            DUALSENSE_USBIP_SPEED,  # High Speed (480Mbps), matching physical DualSense
+            2,      # speed = Full Speed (12Mbps), matching DS5_Bridge / DualSense audio timing
             0x054c, # idVendor = Sony
             0x0ce6, # idProduct = DualSense
             0x0100, # bcdDevice = 1.00
